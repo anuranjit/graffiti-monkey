@@ -14,19 +14,30 @@
 
 import logging
 
-from exceptions import *
-
 import boto
 from boto import ec2
 
+import boto3
+
 import time
+
+from graffiti_monkey.exceptions import GraffitiMonkeyException
+
+no_settings = False
+try:
+    from conf import settings
+except:
+    no_settings = True
+    pass
 
 __all__ = ('GraffitiMonkey', 'Logging')
 log = logging.getLogger(__name__)
 
 
 class GraffitiMonkey(object):
-    def __init__(self, region, profile, instance_tags_to_propagate, volume_tags_to_propagate, volume_tags_to_be_set, snapshot_tags_to_be_set, dryrun, append, volumes_to_tag, snapshots_to_tag, instance_filter, novolumes, nosnapshots):
+    def __init__(self, region, profile, instance_tags_to_propagate, volume_tags_to_propagate, volume_tags_to_be_set,
+                 snapshot_tags_to_be_set, dryrun, append, volumes_to_tag, snapshots_to_tag, instance_filter, novolumes,
+                 nosnapshots, _ami_tags_to_set, set_tag_amis):
         # This list of tags associated with an EC2 instance to propagate to
         # attached EBS volumes
         self._instance_tags_to_propagate = instance_tags_to_propagate
@@ -41,6 +52,9 @@ class GraffitiMonkey(object):
         # This is a dict of tags (keys and values) which will be set on the snapshots
         self._snapshot_tags_to_be_set = snapshot_tags_to_be_set
 
+        self._ami_tags_to_set = _ami_tags_to_set
+
+        self.set_tag_amis = set_tag_amis
         # The region to operate in
         self._region = region
 
@@ -67,10 +81,17 @@ class GraffitiMonkey(object):
 
         # If we process snapshots
         self._nosnapshots = nosnapshots
-
         log.info("Starting Graffiti Monkey")
-        log.info("Options: dryrun %s, append %s, novolumes %s, nosnapshots %s", self._dryrun, self._append, self._novolumes, self._nosnapshots)
+        log.info("Options: dryrun %s, append %s, novolumes %s, nosnapshots %s", self._dryrun, self._append,
+                 self._novolumes, self._nosnapshots)
         log.info("Connecting to region %s using profile %s", self._region, self._profile)
+        try:
+            self._boto3_conn = boto3.client("ec2", region_name=self._region[0] if isinstance(self._region,
+                                                                                             list) else self._region)
+        except Exception as e:
+            log.exception("Error in connection to AWS {} in {} region".format("ec2", self._region))
+            raise GraffitiMonkeyException('Error in connecting to AWS EC2. Check logs for more details')
+
         try:
             self._conn = ec2.connect_to_region(self._region, profile_name=self._profile)
         except boto.exception.NoAuthHandlerFound:
@@ -82,7 +103,6 @@ class GraffitiMonkey(object):
             except boto.exception.NoAuthHandlerFound:
                 raise GraffitiMonkeyException('No AWS credentials found - check your credentials')
 
-
     def propagate_tags(self):
         ''' Propagates tags by copying them from EC2 instance to EBS volume, and
         then to snapshot '''
@@ -91,33 +111,36 @@ class GraffitiMonkey(object):
         if not self._novolumes:
             volumes = self.tag_volumes()
 
-        volumes = { v.id: v for v in volumes }
+        volumes = {v.id: v for v in volumes}
 
         if not self._nosnapshots:
             self.tag_snapshots(volumes)
+
+        if self.set_tag_amis:
+            self.tag_amis()
 
     def tag_volumes(self):
         ''' Gets a list of volumes, and then loops through them tagging
         them '''
 
         storage_counter = 0
-        volumes   = []
+        volumes = []
         instances = {}
 
         if self._volumes_to_tag:
             log.info('Using volume list from cli/config file')
 
             # Max of 200 filters in a request
-            for chunk in (self._volumes_to_tag[n:n+200] for n in xrange(0, len(self._volumes_to_tag), 200)):
+            for chunk in (self._volumes_to_tag[n:n + 200] for n in xrange(0, len(self._volumes_to_tag), 200)):
                 chunk_volumes = self._conn.get_all_volumes(
-                        filters = { 'volume-id': chunk }
-                        )
+                    filters={'volume-id': chunk}
+                )
                 volumes += chunk_volumes
 
                 chunk_instance_ids = set(v.attach_data.instance_id for v in chunk_volumes)
                 reservations = self._conn.get_all_instances(
-                        filters = {'instance-id': [id for id in chunk_instance_ids]}
-                        )
+                    filters={'instance-id': [id for id in chunk_instance_ids]}
+                )
                 for reservation in reservations:
                     for instance in reservation.instances:
                         instances[instance.id] = instance
@@ -133,7 +156,8 @@ class GraffitiMonkey(object):
 
         elif self._instance_filter:
             log.info('Filter instances and retrieve volume ids')
-            instances = dict((instance.id, instance) for instance in self._conn.get_only_instances(filters=self._instance_filter))
+            instances = dict(
+                (instance.id, instance) for instance in self._conn.get_only_instances(filters=self._instance_filter))
             volumes = self._conn.get_all_volumes(filters={'attachment.instance-id': list(instances.keys())})
 
         else:
@@ -155,10 +179,11 @@ class GraffitiMonkey(object):
         for volume in volumes:
             this_vol += 1
             storage_counter += volume.size
-            log.info ('Processing volume %d of %d total volumes', this_vol, total_vols)
+            log.info('Processing volume %d of %d total volumes', this_vol, total_vols)
 
             if volume.status != 'in-use':
-                log.debug('Skipping %s as it is not attached to an EC2 instance, so there is nothing to propagate', volume.id)
+                log.debug('Skipping %s as it is not attached to an EC2 instance, so there is nothing to propagate',
+                          volume.id)
                 continue
 
             for attempt in range(5):
@@ -168,19 +193,20 @@ class GraffitiMonkey(object):
                     log.error("Encountered Error %s on volume %s", e.error_code, volume.id)
                     break
                 except boto.exception.BotoServerError, e:
-                    log.error("Encountered Error %s on volume %s, waiting %d seconds then retrying", e.error_code, volume.id, attempt)
+                    log.error("Encountered Error %s on volume %s, waiting %d seconds then retrying", e.error_code,
+                              volume.id, attempt)
                     time.sleep(attempt)
                 else:
                     break
             else:
-                log.error("Encountered Error %s on volume %s, %d retries failed, continuing", e.error_code, volume.id, attempt)
+                log.error("Encountered Error %s on volume %s, %d retries failed, continuing", e.error_code, volume.id,
+                          attempt)
                 continue
 
         log.info('Processed a total of {0} GB of AWS Volumes'.format(storage_counter))
         log.info('Completed processing all volumes')
 
         return volumes
-
 
     def tag_volume(self, volume, instances):
         ''' Tags a specific volume '''
@@ -218,6 +244,17 @@ class GraffitiMonkey(object):
             self._set_resource_tags(volume, tags_to_set)
         return True
 
+    def tag_amis(self):
+        instances = self._boto3_conn.describe_instances()
+        ami_tags_to_set = self._ami_tags_to_set
+        all_instances = instances.get("Reservations")
+        for instance in all_instances:
+            for i in instance.get("Instances"):
+                image_id = i.get("ImageId")
+                instance = i.get("InstanceId")
+                tags = i.get("Tags") + [{"Key": "instance_id", "Value": instance}]
+                fix_tag_keys = [tag for tag in tags if not tag.get("Key", "").startswith("aws")]
+                self._boto3_conn.create_tags(Resources=[image_id], Tags=fix_tag_keys)
 
     def tag_snapshots(self, volumes):
         ''' Gets a list of snapshots, and then loops through them tagging
@@ -228,10 +265,10 @@ class GraffitiMonkey(object):
             log.info('Using snapshot list from cli/config file')
 
             # Max of 200 filters in a request
-            for chunk in (self._snapshots_to_tag[n:n+200] for n in xrange(0, len(self._snapshots_to_tag), 200)):
+            for chunk in (self._snapshots_to_tag[n:n + 200] for n in xrange(0, len(self._snapshots_to_tag), 200)):
                 chunk_snapshots = self._conn.get_all_snapshots(
-                        filters = { 'snapshot-id': chunk }
-                        )
+                    filters={'snapshot-id': chunk}
+                )
                 snapshots += chunk_snapshots
             snapshot_ids = [s.id for s in snapshots]
 
@@ -253,10 +290,10 @@ class GraffitiMonkey(object):
         extra_volume_ids = [id for id in all_volume_ids if id not in volumes]
 
         ''' Fetch any extra volumes that weren't carried over from tag_volumes() (if any) '''
-        for chunk in (extra_volume_ids[n:n+200] for n in xrange(0, len(extra_volume_ids), 200)):
+        for chunk in (extra_volume_ids[n:n + 200] for n in xrange(0, len(extra_volume_ids), 200)):
             extra_volumes = self._conn.get_all_volumes(
-                    filters = { 'volume-id': chunk }
-                    )
+                filters={'volume-id': chunk}
+            )
             for vol in extra_volumes:
                 volumes[vol.id] = vol
 
@@ -267,7 +304,7 @@ class GraffitiMonkey(object):
 
         for snapshot in snapshots:
             this_snap += 1
-            log.info ('Processing snapshot %d of %d total snapshots', this_snap, total_snaps)
+            log.info('Processing snapshot %d of %d total snapshots', this_snap, total_snaps)
             for attempt in range(5):
                 try:
                     self.tag_snapshot(snapshot, volumes)
@@ -275,12 +312,14 @@ class GraffitiMonkey(object):
                     log.error("Encountered Error %s on snapshot %s", e.error_code, snapshot.id)
                     break
                 except boto.exception.BotoServerError, e:
-                    log.error("Encountered Error %s on snapshot %s, waiting %d seconds then retrying", e.error_code, snapshot.id, attempt)
+                    log.error("Encountered Error %s on snapshot %s, waiting %d seconds then retrying", e.error_code,
+                              snapshot.id, attempt)
                     time.sleep(attempt)
                 else:
                     break
             else:
-                log.error("Encountered Error %s on snapshot %s, %d retries failed, continuing", e.error_code, snapshot.id, attempt)
+                log.error("Encountered Error %s on snapshot %s, %d retries failed, continuing", e.error_code,
+                          snapshot.id, attempt)
                 continue
         log.info('Completed processing all snapshots')
 
@@ -314,7 +353,6 @@ class GraffitiMonkey(object):
             self._set_resource_tags(snapshot, tags_to_set)
         return True
 
-
     def _set_resource_tags(self, resource, tags):
         ''' Sets the tags on the given AWS resource '''
 
@@ -335,13 +373,12 @@ class GraffitiMonkey(object):
         resource.add_tags(delta_tags)
 
 
-
 class Logging(object):
     # Logging formats
     _log_simple_format = '%(asctime)s [%(levelname)s] %(message)s'
     _log_detailed_format = '%(asctime)s [%(levelname)s] [%(name)s(%(lineno)s):%(funcName)s] %(message)s'
 
-    def configure(self, verbosity = None):
+    def configure(self, verbosity=None):
         ''' Configure the logging format and verbosity '''
 
         # Configure our logging output

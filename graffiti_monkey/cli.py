@@ -35,6 +35,8 @@ class GraffitiMonkeyCli(object):
         self.args = None
         self.config = {"_instance_tags_to_propagate": ['Name'],
                        "_volume_tags_to_propagate": ['Name', 'instance_id', 'device'],
+                       "_ami_tags": False,
+                       "_ami_tags_to_set": [],
                        "_volume_tags_to_be_set": [],
                        "_snapshot_tags_to_be_set": [],
                        "_instance_filter": [],
@@ -44,6 +46,7 @@ class GraffitiMonkeyCli(object):
         self.volumes = None
         self.snapshots = None
         self.instancefilter = None
+        self.set_tag_amis = None
         self.novolumes = False
         self.nosnapshots = False
 
@@ -60,7 +63,8 @@ class GraffitiMonkeyCli(object):
         return sys.argv[1:]
 
     def set_cli_args(self):
-        parser = argparse.ArgumentParser(description='Propagates tags from AWS EC2 instances to EBS volumes, and then to EBS snapshots. This makes it much easier to find things down the road.')
+        parser = argparse.ArgumentParser(
+            description='Propagates tags from AWS EC2 instances to EBS volumes, and then to EBS snapshots. This makes it much easier to find things down the road.')
         parser.add_argument('--region', metavar='REGION',
                             help='the region to tag things in (default is current region of EC2 instance this is running on). E.g. us-east-1')
         parser.add_argument('--profile', metavar='PROFILE',
@@ -70,7 +74,7 @@ class GraffitiMonkeyCli(object):
         parser.add_argument('--version', action='version', version='%(prog)s ' + __version__,
                             help='display version number and exit')
         parser.add_argument('--config', '-c', nargs="?", type=argparse.FileType('r'),
-                        default=None, help="Give a yaml configuration file")
+                            default=None, help="Give a yaml configuration file")
         parser.add_argument('--dryrun', action='store_true',
                             help='dryrun only, display tagging actions but do not perform them')
         parser.add_argument('--append', action='store_true',
@@ -88,8 +92,8 @@ class GraffitiMonkeyCli(object):
     @staticmethod
     def fail_due_to_bad_config_file(self):
         self._fail("Something went wrong reading the passed yaml config file. "
-                          "Make sure to use valid yaml syntax. "
-                          "Also the start of the file should not be marked with '---'.", 6)
+                   "Make sure to use valid yaml syntax. "
+                   "Also the start of the file should not be marked with '---'.", 6)
 
     def set_config(self):
         if self.args.config:
@@ -101,14 +105,12 @@ class GraffitiMonkeyCli(object):
                 sys.exit(5)
 
             try:
-                #TODO: take default values and these can be overwritten by config
+                # TODO: take default values and these can be overwritten by config
                 self.config = yaml.load(self.args.config)
                 if self.config is None:
-                    self.fail_due_to_bad_config_file()
-            except:
-                self.fail_due_to_bad_config_file()
-
-
+                    self.fail_due_to_bad_config_file(self)
+            except Exception as e:
+                self.fail_due_to_bad_config_file(self)
 
     def set_region(self):
         if self.args.region:
@@ -122,7 +124,8 @@ class GraffitiMonkeyCli(object):
             instance_metadata = get_instance_metadata(timeout=5)
             log.debug('Instance meta-data: %s', instance_metadata)
             if not instance_metadata:
-                GraffitiMonkeyCli._fail('Could not determine region. This script is either not running on an EC2 instance (in which case you should use the --region option), or the meta-data service is down')
+                GraffitiMonkeyCli._fail(
+                    'Could not determine region. This script is either not running on an EC2 instance (in which case you should use the --region option), or the meta-data service is down')
 
             self.region = instance_metadata['placement']['availability-zone'][:-1]
         log.debug("Running in region: %s", self.region)
@@ -148,6 +151,9 @@ class GraffitiMonkeyCli(object):
         elif "_volumes_to_tag" in self.config.keys():
             self.volumes = self.config["_volumes_to_tag"]
 
+    def set_amis(self):
+        self.set_tag_amis = "_amis_tag" in self.config.keys()
+
     def set_snapshots(self):
         if self.args.snapshots:
             self.snapshots = self.args.snapshots
@@ -172,8 +178,8 @@ class GraffitiMonkeyCli(object):
     def initialize_monkey(self):
         self.monkey = GraffitiMonkey(self.region,
                                      self.profile,
-                                     self.config["_instance_tags_to_propagate"],
-                                     self.config["_volume_tags_to_propagate"],
+                                     self.config.get("_instance_tags_to_propagate"),
+                                     self.config.get("_volume_tags_to_propagate"),
                                      self.config_default("_volume_tags_to_be_set"),
                                      self.config_default("_snapshot_tags_to_be_set"),
                                      self.dryrun,
@@ -182,7 +188,9 @@ class GraffitiMonkeyCli(object):
                                      self.snapshots,
                                      self.instancefilter,
                                      self.novolumes,
-                                     self.nosnapshots
+                                     self.nosnapshots,
+                                     self.config.get("_ami_tags_to_set"),
+                                     self.set_tag_amis
                                      )
 
     def start_tags_propagation(self):
@@ -208,7 +216,7 @@ class GraffitiMonkeyCli(object):
         self.set_instancefilter()
         self.set_novolumes()
         self.set_nosnapshots()
-
+        self.set_amis()
         try:
             self.initialize_monkey()
             self.start_tags_propagation()
