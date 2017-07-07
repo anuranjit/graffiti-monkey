@@ -254,7 +254,9 @@ class GraffitiMonkey(object):
                 instance = i.get("InstanceId")
                 tags = i.get("Tags") + [{"Key": "instance_id", "Value": instance}]
                 fix_tag_keys = [tag for tag in tags if not tag.get("Key", "").startswith("aws")]
-                self._boto3_conn.create_tags(Resources=[image_id], Tags=fix_tag_keys)
+                log.info("Creating tag for Instance {} Ami {}".format(instance, image_id))
+                result = self._boto3_conn.create_tags(Resources=[image_id], Tags=fix_tag_keys)
+                log.info("Response from tag creation {}".format(result))
 
     def tag_snapshots(self, volumes):
         ''' Gets a list of snapshots, and then loops through them tagging
